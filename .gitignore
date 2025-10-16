@@ -1,0 +1,121 @@
+# =============================
+# 🧠 Python / FastAPI Backend
+# =============================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# SQLite / Local DB files
+*.db
+*.sqlite3
+
+# Environment variables / secrets
+.env
+.env.*
+*.env
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# VSCode / JetBrains IDE
+.vscode/
+.idea/
+
+# macOS files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+logs/
+*.pid
+
+# Compiled C extensions
+*.so
+
+# Alembic migration cache
+alembic/versions/__pycache__/
+alembic/*.pyc
+
+# Local configuration
+config.json
+settings.json
+
+# Virtual environment folders
+venv/
+env/
+ENV/
+.venv/
+.ENV/
+
+# Coverage and profiling data
+prof/
+profiler-output/
+*.prof
+
+# Pandas / Excel temp files
+~$*.xlsx
+~$*.xls
+*.bak
+*.tmp
+
+# MySQL dumps or backups
+*.sql
+*.dump
+
+# Uploads / temporary user files
+uploads/
+tmp/
+temp/
+__temp__/
+
+# PyCharm project files
+.idea/
+
+# System-specific files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Docker-related (optional)
+docker-compose.override.yml
+*.local.yml
+*.bak.yml
