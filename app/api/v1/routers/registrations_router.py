@@ -60,3 +60,19 @@ def generate_qr(registration_id: int, db: Session = Depends(get_db)):
     if not result:
         raise HTTPException(status_code=404, detail="Registration not found")
     return result
+
+@router.post("/{event_id}/send-qrs-paid")
+async def send_qrs_paid(event_id: int, db: Session = Depends(get_db)):
+    """
+    Genera y envía por correo todos los QR de los participantes pagados en el evento,
+    usando plantilla personalizada con botón de verificación.
+    """
+    return await service.generate_and_send_all_qrs_paid(db, event_id)
+
+@router.post("/{registration_id}/send-single-qr")
+async def send_single_qr(registration_id: int, db: Session = Depends(get_db)):
+    """
+    Genera y envía un solo QR al participante indicado por su registration_id.
+    Útil para pruebas individuales o reenvíos manuales.
+    """
+    return await service.send_single_qr(db, registration_id)

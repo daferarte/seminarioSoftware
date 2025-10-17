@@ -9,10 +9,12 @@ import hmac
 import hashlib
 import json
 import os
+import asyncio
 
 from app.models.event_registration import EventRegistration
 from app.schemas.registration_schema import EventRegistrationCreate
 from app.repositories.registration_repository import EventRegistrationRepository
+from app.core.mail_config import FastMail, MessageSchema, conf
 
 
 class EventRegistrationService:
@@ -23,7 +25,6 @@ class EventRegistrationService:
     # CRUD PRINCIPAL
     # =========================
     def create_registration(self, db: Session, data: EventRegistrationCreate):
-        """Crea un nuevo registro de inscripción de participante a evento."""
         registration = EventRegistration(
             event_id=data.event_id,
             participant_document_id=data.participant_document_id,
@@ -35,33 +36,27 @@ class EventRegistrationService:
         return self.repo.create(db, registration)
 
     def list_registrations(self, db: Session):
-        """Obtiene todas las inscripciones."""
         return self.repo.get_all(db)
 
     def get_registration(self, db: Session, reg_id: int):
-        """Obtiene una inscripción específica por su ID."""
         reg = self.repo.get_by_id(db, reg_id)
         if not reg:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Registration not found")
         return reg
 
     def mark_as_paid(self, db: Session, reg_id: int):
-        """Marca una inscripción como pagada."""
         reg = self.repo.get_by_id(db, reg_id)
         if not reg:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Registration not found")
-
         reg.is_paid = True
         db.commit()
         db.refresh(reg)
         return reg
 
     def mark_as_unpaid(self, db: Session, reg_id: int):
-        """Revertir el estado de pago de una inscripción."""
         reg = self.repo.get_by_id(db, reg_id)
         if not reg:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Registration not found")
-
         reg.is_paid = False
         db.commit()
         db.refresh(reg)
@@ -71,41 +66,25 @@ class EventRegistrationService:
     # IMPORTAR DESDE EXCEL
     # =========================
     def import_from_excel(self, db: Session, file: UploadFile):
-        """Importa múltiples registros de inscripción desde un archivo Excel (.xlsx)."""
         try:
             df = pd.read_excel(file.file)
         except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Error al leer el archivo Excel: {str(e)}"
-            )
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Error al leer Excel: {str(e)}")
 
-        required_columns = {
-            "event_id",
-            "participant_document_id",
-            "registered_by_staff_id",
-            "qr_code_sent",
-            "is_paid",
-        }
-
-        # Validar columnas
+        required_columns = {"event_id", "participant_document_id", "registered_by_staff_id", "qr_code_sent", "is_paid"}
         if not required_columns.issubset(set(df.columns)):
-            raise HTTPException(
-                status_code=400,
-                detail=f"El archivo Excel debe contener las columnas: {', '.join(required_columns)}"
-            )
+            raise HTTPException(status_code=400, detail=f"Faltan columnas: {', '.join(required_columns)}")
 
-        def parse_bool(value):
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, (int, float)):
-                return value != 0
-            if isinstance(value, str):
-                return value.strip().lower() in ["true", "1", "yes", "si", "sí"]
+        def parse_bool(v):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, (int, float)):
+                return v != 0
+            if isinstance(v, str):
+                return v.strip().lower() in ["true", "1", "yes", "si", "sí"]
             return False
 
         inserted, skipped = 0, 0
-
         for _, row in df.iterrows():
             try:
                 event_id = int(row["event_id"])
@@ -113,21 +92,15 @@ class EventRegistrationService:
                 staff_id = int(row["registered_by_staff_id"])
                 qr_sent = parse_bool(row["qr_code_sent"])
                 is_paid = parse_bool(row["is_paid"])
-            except Exception as e:
-                skipped += 1
-                print(f"⚠️ Error al procesar fila: {row.to_dict()} → {e}")
-                continue
-
-            existing = self.repo.get_existing_registration(
-                db,
-                event_id=event_id,
-                participant_document_id=participant_id,
-            )
-            if existing:
+            except Exception:
                 skipped += 1
                 continue
 
-            registration = EventRegistration(
+            if self.repo.get_existing_registration(db, event_id=event_id, participant_document_id=participant_id):
+                skipped += 1
+                continue
+
+            reg = EventRegistration(
                 event_id=event_id,
                 participant_document_id=participant_id,
                 registered_by_staff_id=staff_id,
@@ -135,24 +108,16 @@ class EventRegistrationService:
                 qr_sent_at=datetime.utcnow() if qr_sent else None,
                 is_paid=is_paid,
             )
-
-            db.add(registration)
+            db.add(reg)
             inserted += 1
-
         db.commit()
 
-        return {
-            "status": "success",
-            "inserted": inserted,
-            "skipped": skipped,
-            "message": f"✅ Se importaron {inserted} inscripciones. Se omitieron {skipped} duplicadas o con errores."
-        }
+        return {"status": "success", "inserted": inserted, "skipped": skipped}
 
     # =========================
-    # GENERAR Y GUARDAR QR
+    # GENERAR QR INDIVIDUAL
     # =========================
     def generate_qr_for_registration(self, db: Session, reg_id: int):
-        """Genera un QR firmado, lo guarda como PNG en disco y lo devuelve en base64."""
         reg = self.repo.get_by_id(db, reg_id)
         if not reg:
             raise HTTPException(status_code=404, detail="Registration not found")
@@ -160,61 +125,244 @@ class EventRegistrationService:
         event = getattr(reg, "event", None)
         participant = getattr(reg, "participant", None)
 
-        # 🔸 Datos para el QR
         payload = {
             "registration_id": reg.id,
             "event_id": reg.event_id,
             "participant_document_id": reg.participant_document_id,
             "timestamp": datetime.utcnow().isoformat(),
         }
-
-        # 🔒 Firma HMAC (clave configurable)
         secret_key = b"ucc-seminario-secret-key"
-        signature = hmac.new(
-            secret_key,
-            json.dumps(payload, sort_keys=True).encode("utf-8"),
-            hashlib.sha256
+        payload["signature"] = hmac.new(
+            secret_key, json.dumps(payload, sort_keys=True).encode(), hashlib.sha256
         ).hexdigest()
-        payload["signature"] = signature
 
-        # 🔲 Generar QR
-        qr_data = json.dumps(payload)
-        qr = qrcode.QRCode(
-            version=1,
-            error_correction=qrcode.constants.ERROR_CORRECT_L,
-            box_size=10,
-            border=4,
-        )
-        qr.add_data(qr_data)
+        qr = qrcode.QRCode(box_size=10, border=4)
+        qr.add_data(json.dumps(payload))
         qr.make(fit=True)
         img = qr.make_image(fill_color="black", back_color="white")
 
-        # 🧭 Ruta del archivo
         event_name = (event.name if event else f"evento_{reg.event_id}").replace(" ", "_")
         save_dir = os.path.join("app", "static", "qrs", event_name)
         os.makedirs(save_dir, exist_ok=True)
-
-        filename = f"{reg.participant_document_id}.png"
-        file_path = os.path.join(save_dir, filename)
-
-        # 🖼 Guardar en disco
+        file_path = os.path.join(save_dir, f"{reg.participant_document_id}.png")
         img.save(file_path)
 
-        # 🔁 Convertir también a base64
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        base64_png = base64.b64encode(buf.getvalue()).decode("utf-8")
+        base64_png = base64.b64encode(buf.getvalue()).decode()
         buf.close()
 
         return {
             "status": "success",
-            "message": "QR generado y guardado correctamente",
-            "registration_id": reg.id,
-            "event": event.name if event else f"Evento {reg.event_id}",
-            "participant": (
-                f"{participant.first_name} {participant.last_name}"
-                if participant else reg.participant_document_id
-            ),
             "qr_image_path": file_path,
             "qr_image_base64": f"data:image/png;base64,{base64_png}",
+        }
+
+    # =========================
+    # GENERAR Y ENVIAR QRS PAGADOS (ASÍNCRONO CON PLANTILLA)
+    # =========================
+    async def generate_and_send_all_qrs_paid(self, db: Session, event_id: int):
+        from app.models.participant import Participant
+        from app.models.event import Event
+
+        event = db.query(Event).filter_by(id=event_id).first()
+        if not event:
+            raise HTTPException(status_code=404, detail="Event not found")
+
+        regs = (
+            db.query(EventRegistration)
+            .filter(EventRegistration.event_id == event_id, EventRegistration.is_paid == True)
+            .all()
+        )
+        if not regs:
+            return {"message": f"No hay inscripciones pagadas para el evento '{event.name}'."}
+
+        event_dir = os.path.join("app", "static", "qrs", event.name.replace(" ", "_"))
+        os.makedirs(event_dir, exist_ok=True)
+
+        secret_key = b"ucc-seminario-secret-key"
+        fm = FastMail(conf)
+
+        async def send_email_task(reg, participant):
+            payload = {
+                "registration_id": reg.id,
+                "event_id": event.id,
+                "participant_document_id": participant.document_id,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            payload["signature"] = hmac.new(
+                secret_key, json.dumps(payload, sort_keys=True).encode(), hashlib.sha256
+            ).hexdigest()
+
+            qr_img = qrcode.make(json.dumps(payload))
+            qr_path = os.path.join(event_dir, f"{participant.document_id}.png")
+            qr_img.save(qr_path)
+
+            # QR como base64 embebido
+            buf = io.BytesIO()
+            qr_img.save(buf, format="PNG")
+            qr_base64 = base64.b64encode(buf.getvalue()).decode()
+            buf.close()
+            qr_inline = f"data:image/png;base64,{qr_base64}"
+
+            # Enlace de verificación (ajusta a tu dominio/ruta)
+            verify_url = f"https://iemchambu2.edu.co/verify-qr/{reg.id}"
+
+            # Plantilla HTML profesional
+            html_body = f"""
+            <div style="font-family: Arial, sans-serif; color: #222; line-height: 1.6; padding: 20px; max-width: 600px; margin: auto; border: 1px solid #ddd; border-radius: 10px;">
+                <h2 style="color: #004b87;">Plantilla para Entrega de QR de Acceso a Seminario de Ingeniería</h2>
+                <p>¡Hola, <b>{participant.first_name} {participant.last_name}</b>!</p>
+
+                <p>Tu acceso para el seminario de ingeniería <b>{event.name}</b> programado para <b>viernes, 17 de octubre de 2025</b>, está listo.</p>
+
+                <p>A continuación encontrarás tu código QR personal e intransferible. Por favor, preséntalo en la entrada para agilizar tu registro:</p>
+
+                <div style="text-align:center; margin:20px 0;">
+                    <img src="{qr_inline}" alt="Código QR" style="width:200px; height:200px; border:2px solid #004b87; padding:5px; border-radius:8px;">
+                </div>
+
+                <p>También puedes verificar tu registro haciendo clic en el siguiente enlace:</p>
+                <p style="text-align:center; margin: 20px 0;">
+                    <a href="{verify_url}" style="background-color:#004b87; color:#fff; text-decoration:none; padding:10px 20px; border-radius:5px;">Verificar mi QR</a>
+                </p>
+
+                <p>¡Te esperamos! 👋</p>
+
+                <hr style="border:none; border-top:1px solid #ddd;">
+                <p style="font-size:12px; color:#666; text-align:center;">
+                    Universidad Cooperativa de Colombia - Campus Pasto<br>
+                    Seminario de Ingeniería de Software<br>
+                    © 2025 Todos los derechos reservados.
+                </p>
+            </div>
+            """
+
+            message = MessageSchema(
+                subject=f"Tu Acceso al {event.name}",
+                recipients=[participant.email],
+                body=html_body,
+                subtype="html",
+                attachments=[qr_path],
+            )
+
+            await fm.send_message(message)
+            return participant.email
+
+        # Ejecutar todas las tareas en paralelo
+        tasks = []
+        for reg in regs:
+            participant = db.query(Participant).filter_by(document_id=reg.participant_document_id).first()
+            if participant and participant.email:
+                tasks.append(send_email_task(reg, participant))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        sent = [r for r in results if isinstance(r, str)]
+        failed = [str(r) for r in results if isinstance(r, Exception)]
+
+        return {
+            "status": "success",
+            "event": event.name,
+            "generated_qrs": len(regs),
+            "emails_sent": len(sent),
+            "failed_emails": failed,
+            "message": f"✅ {len(sent)} correos enviados correctamente para el evento '{event.name}'."
+        }
+
+    # =========================
+    # ENVIAR UN SOLO QR POR CORREO (PRUEBA)
+    # =========================
+    async def send_single_qr(self, db: Session, reg_id: int):
+        from app.models.participant import Participant
+        from app.models.event import Event
+
+        reg = self.repo.get_by_id(db, reg_id)
+        if not reg:
+            raise HTTPException(status_code=404, detail="Registration not found")
+
+        participant = db.query(Participant).filter_by(document_id=reg.participant_document_id).first()
+        event = db.query(Event).filter_by(id=reg.event_id).first()
+
+        if not participant or not participant.email:
+            raise HTTPException(status_code=404, detail="Participant not found or email missing")
+
+        secret_key = b"ucc-seminario-secret-key"
+        payload = {
+            "registration_id": reg.id,
+            "event_id": reg.event_id,
+            "participant_document_id": participant.document_id,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        payload["signature"] = hmac.new(
+            secret_key, json.dumps(payload, sort_keys=True).encode(), hashlib.sha256
+        ).hexdigest()
+
+        # Generar imagen QR
+        qr_img = qrcode.make(json.dumps(payload))
+        event_dir = os.path.join("app", "static", "qrs", event.name.replace(" ", "_"))
+        os.makedirs(event_dir, exist_ok=True)
+        qr_path = os.path.join(event_dir, f"{participant.document_id}.png")
+        qr_img.save(qr_path)
+
+        # Base64 inline
+        buf = io.BytesIO()
+        qr_img.save(buf, format="PNG")
+        qr_base64 = base64.b64encode(buf.getvalue()).decode()
+        buf.close()
+        qr_inline = f"data:image/png;base64,{qr_base64}"
+
+        verify_url = f"https://iemchambu2.edu.co/verify-qr/{reg.id}"
+
+        html_body = f"""
+        <div style="font-family: Arial, sans-serif; color: #222; line-height: 1.6; padding: 20px; max-width: 600px; margin: auto; border: 1px solid #ddd; border-radius: 10px;">
+            <h2 style="color: #004b87;">Plantilla para Entrega de QR de Acceso a Seminario de Ingeniería</h2>
+            <p>¡Hola, <b>{participant.first_name} {participant.last_name}</b>!</p>
+
+            <p>Tu acceso para el seminario de ingeniería <b>{event.name}</b> programado para <b>viernes, 17 de octubre de 2025</b>, está listo.</p>
+
+            <p>A continuación encontrarás tu código QR personal e intransferible. Por favor, preséntalo en la entrada para agilizar tu registro:</p>
+
+            <div style="text-align:center; margin:20px 0;">
+                <img src="{qr_inline}" alt="Código QR" style="width:200px; height:200px; border:2px solid #004b87; padding:5px; border-radius:8px;">
+            </div>
+
+            <p>También puedes verificar tu registro haciendo clic en el siguiente enlace:</p>
+            <p style="text-align:center; margin: 20px 0;">
+                <a href="{verify_url}" style="background-color:#004b87; color:#fff; text-decoration:none; padding:10px 20px; border-radius:5px;">Verificar mi QR</a>
+            </p>
+
+            <p>¡Te esperamos! 👋</p>
+
+            <hr style="border:none; border-top:1px solid #ddd;">
+            <p style="font-size:12px; color:#666; text-align:center;">
+                Universidad Cooperativa de Colombia - Campus Pasto<br>
+                Seminario de Ingeniería de Software<br>
+                © 2025 Todos los derechos reservados.
+            </p>
+        </div>
+        """
+
+        fm = FastMail(conf)
+        message = MessageSchema(
+            subject=f"Tu Acceso al {event.name}",
+            recipients=[participant.email],
+            body=html_body,
+            subtype="html",
+            attachments=[qr_path],
+        )
+
+        await fm.send_message(message)
+
+        # Marcar como enviado
+        reg.qr_code_sent = True
+        reg.qr_sent_at = datetime.utcnow()
+        db.commit()
+
+        return {
+            "status": "success",
+            "message": f"Correo enviado correctamente a {participant.email}",
+            "participant": f"{participant.first_name} {participant.last_name}",
+            "event": event.name,
+            "email": participant.email,
+            "qr_image": f"data:image/png;base64,{qr_base64}"
         }

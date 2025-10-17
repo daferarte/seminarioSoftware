@@ -119,3 +119,6 @@ Desktop.ini
 docker-compose.override.yml
 *.local.yml
 *.bak.yml
+
+
+static
